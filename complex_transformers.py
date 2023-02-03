@@ -6,7 +6,7 @@ import numpy as np
 class ComplexEncoder(layers.Layer):
     def __init__(
         self, intermediate_dim, num_heads, dropout=0,
-        operation="real", use_temperature=True,
+        attention_width=None, operation="real", use_temperature=True,
         **kwargs
     ):
         super(ComplexEncoder, self).__init__(**kwargs)
@@ -15,6 +15,7 @@ class ComplexEncoder(layers.Layer):
         self.num_heads = num_heads
         self.operation = operation
         self.use_temperature = use_temperature
+        self.attention_width = attention_width
         self.supports_masking = True
 
     def build(self, input_shape):
@@ -23,6 +24,7 @@ class ComplexEncoder(layers.Layer):
 
         self.attention = MultiHeadComplexAttention(
             self.num_heads, key_dim=head_dim,
+            attention_width=self.attention_width,
             operation=self.operation, use_temperature=self.use_temperature)
         self.attention_dropout = layers.Dropout(rate=self.dropout)
 
@@ -56,12 +58,13 @@ class ComplexEncoder(layers.Layer):
 class ComplexDecoder(layers.Layer):
     def __init__(
         self, intermediate_dim, num_heads, dropout=0,
-        operation="real", use_temperature=True,
+        attention_width=None, operation="real", use_temperature=True,
         **kwargs
     ):
         super(ComplexDecoder, self).__init__(**kwargs)
         self.intermediate_dim = intermediate_dim
         self.dropout = dropout
+        self.attention_width = attention_width
         self.num_heads = num_heads
         self.operation = operation
         self.use_temperature = use_temperature
@@ -73,12 +76,14 @@ class ComplexDecoder(layers.Layer):
 
         self.attention = MultiHeadComplexAttention(
             self.num_heads, key_dim=head_dim, causal_mask=True,
-            operation=self.operation, use_temperature=self.use_temperature)
+            operation=self.operation, use_temperature=self.use_temperature,
+            attention_width=self.attention_width)
         self.attention_dropout = layers.Dropout(rate=self.dropout)
 
         self.cross_attention = MultiHeadComplexAttention(
             self.num_heads, key_dim=head_dim, causal_mask=True,
-            operation=self.operation, use_temperature=self.use_temperature)
+            operation=self.operation, use_temperature=self.use_temperature,
+            attention_width=self.attention_width)
         self.cross_attention_dropout = layers.Dropout(rate=self.dropout)
 
         self.feedforward_intermediate = layers.Dense(
@@ -91,6 +96,9 @@ class ComplexDecoder(layers.Layer):
         self.layer_norm_1 = layers.LayerNormalization(epsilon=1e-5)
         self.layer_norm_2 = layers.LayerNormalization(epsilon=1e-5)
         self.layer_norm_3 = layers.LayerNormalization(epsilon=1e-5)
+
+        self.summarizer = ComplexAttentivePooling(
+            self.intermediate_dim, self.num_heads)
 
     def call(
         self,
@@ -107,11 +115,14 @@ class ComplexDecoder(layers.Layer):
 
         cross_attention_output = self.cross_attention(
             inputs, value=encoder_inputs, mask=mask)
+        cross_attention_output = self.cross_attention_dropout(
+            cross_attention_output)
         layer_norm_2_output = self.layer_norm_2(
             cross_attention_output + layer_norm_output)
 
         ff_out_1 = self.feedforward_intermediate(layer_norm_2_output)
         ff_out_2 = self.feedforward_output(ff_out_1)
+        ff_out_2 = self.feedforward_dropout(ff_out_2)
 
         layer_norm_3_output = self.layer_norm_3(
             ff_out_2 + layer_norm_2_output)
@@ -437,10 +448,14 @@ class ComplexAttentivePooling(layers.Layer):
         else:
             hidden_dim = self.output_dim
 
-        self.key_real = self.add_weight(shape=(self.num_heads, self.key_dim, 1),
-                                              initializer="glorot_uniform")
-        self.key_imag = self.add_weight(shape=(self.num_heads, self.key_dim, 1),
-                                              initializer="glorot_uniform")
+        self.key_real = self.add_weight(
+            name="key_real",
+            shape=(self.num_heads, self.key_dim, 1),
+            initializer="glorot_uniform")
+        self.key_imag = self.add_weight(
+            name="key_imag",
+            shape=(self.num_heads, self.key_dim, 1),
+            initializer="glorot_uniform")
 
         self.query_denses = [
             ComplexDense(self.key_dim)
@@ -450,8 +465,8 @@ class ComplexAttentivePooling(layers.Layer):
             layers.Dense(self.value_dim, kernel_initializer="glorot_uniform")
             for _ in range(self.num_heads)
         ]
-        self.feedforward = layers.Dense(hidden_dim,
-                                        kernel_initializer="glorot_uniform")
+        self.feedforward = layers.Dense(
+            hidden_dim, kernel_initializer="glorot_uniform")
         self.layer_norm = layers.LayerNormalization(epsilon=1e-6)
 
     def call(self, inputs, mask=None):
