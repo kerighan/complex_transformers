@@ -6,7 +6,7 @@ import numpy as np
 class ComplexEncoder(layers.Layer):
     def __init__(
         self, intermediate_dim, num_heads, dropout=0,
-        attention_width=None, operation="real", use_temperature=True,
+        attention_width=None, operation="real", use_temperature=False,
         **kwargs
     ):
         super(ComplexEncoder, self).__init__(**kwargs)
@@ -58,7 +58,7 @@ class ComplexEncoder(layers.Layer):
 class ComplexDecoder(layers.Layer):
     def __init__(
         self, intermediate_dim, num_heads, dropout=0,
-        attention_width=None, operation="real", use_temperature=True,
+        attention_width=None, operation="real", use_temperature=False,
         **kwargs
     ):
         super(ComplexDecoder, self).__init__(**kwargs)
@@ -78,12 +78,20 @@ class ComplexDecoder(layers.Layer):
             self.num_heads, key_dim=head_dim, causal_mask=True,
             operation=self.operation, use_temperature=self.use_temperature,
             attention_width=self.attention_width)
+        # self.attention = ComplexAttention(
+        #     key_dim=head_dim, causal_mask=True, operation=self.operation,
+        #     use_temperature=self.use_temperature,
+        #     attention_width=self.attention_width)
         self.attention_dropout = layers.Dropout(rate=self.dropout)
 
         self.cross_attention = MultiHeadComplexAttention(
             self.num_heads, key_dim=head_dim, causal_mask=True,
             operation=self.operation, use_temperature=self.use_temperature,
             attention_width=self.attention_width)
+        # self.cross_attention = ComplexAttention(
+        #     key_dim=head_dim, causal_mask=True, operation=self.operation,
+        #     use_temperature=self.use_temperature,
+        #     attention_width=self.attention_width)
         self.cross_attention_dropout = layers.Dropout(rate=self.dropout)
 
         self.feedforward_intermediate = layers.Dense(
@@ -143,11 +151,12 @@ class ComplexAttention(layers.Layer):
         dropout=0.0,
         operation="real",
         use_temperature=False,
+        use_position=True,
         **kwargs
     ):
         super(ComplexAttention, self).__init__(**kwargs)
         self.key_dim = key_dim
-        self.value_dim = value_dim if value_dim is None else value_dim
+        self.value_dim = key_dim if value_dim is None else value_dim
         self.attention_width = attention_width
         self.use_bias = use_bias
         self.causal_mask = causal_mask
@@ -155,6 +164,7 @@ class ComplexAttention(layers.Layer):
         self.supports_masking = True
         self.operation = get_operation(operation)
         self.use_temperature = use_temperature
+        self.use_position = use_position
 
     def build(self, input_shape):
         self.query = ComplexDense(self.key_dim, use_bias=self.use_bias)
@@ -181,7 +191,8 @@ class ComplexAttention(layers.Layer):
                 tf.math.abs(ind[:, None] - ind) <= self.attention_width,
                 dtype=tf.float32)
 
-        self.attention_interference = AttentionInterference(self.key_dim)
+        if self.use_position:
+            self.attention_interference = AttentionInterference(self.key_dim)
 
     def call(
         self, query, value=None, key=None,
@@ -201,10 +212,11 @@ class ComplexAttention(layers.Layer):
         query = tf.multiply(query, 1.0 / float(self.key_dim)**.5)
 
         # apply attention interference
-        if attention_interference is None:
-            attention_interference = self.attention_interference(query)
-        key += attention_interference[0]
-        query += attention_interference[1]
+        if self.use_position:
+            if attention_interference is None:
+                attention_interference = self.attention_interference(query)
+            key += attention_interference[0]
+            query += attention_interference[1]
 
         # compute attention scores
         interference = tf.matmul(query, key, transpose_b=True)
@@ -263,6 +275,11 @@ class MultiHeadComplexAttention(layers.Layer):
 
     def build(self, input_shape):
         hidden_dim = input_shape[-1]
+        self.dense = layers.Dense(
+            hidden_dim, use_bias=self.use_bias,
+            kernel_initializer="glorot_uniform",
+            name="dense")
+
         self.attentions = [
             ComplexAttention(key_dim=self.key_dim,
                              value_dim=self.value_dim,
@@ -270,12 +287,11 @@ class MultiHeadComplexAttention(layers.Layer):
                              use_bias=self.use_bias,
                              causal_mask=self.causal_mask,
                              operation=self.operation,
-                             use_temperature=self.use_temperature)
-            for _ in range(self.num_heads)
-        ]
-        self.dense = layers.Dense(
-            hidden_dim, use_bias=self.use_bias,
-            kernel_initializer="glorot_uniform")
+                             use_temperature=self.use_temperature,
+                             name=f"attention_{i}")
+            for i in range(self.num_heads)]
+        for attention in self.attentions:
+            self.trainable_weights.extend(attention.trainable_weights)
 
     def call(
         self, query, value=None, key=None,
@@ -283,9 +299,9 @@ class MultiHeadComplexAttention(layers.Layer):
         mask=None
     ):
         res = []
-        for attention in self.attentions:
-            attention_out = attention(query, value, key,
-                                      attention_interference, mask)
+        for i in range(self.num_heads):
+            attention_out = self.attentions[i](
+                query, value, key, attention_interference, mask)
             res.append(attention_out)
         res = tf.concat(res, axis=-1)
         output = self.dense(res)
@@ -429,6 +445,7 @@ class PositionalEncoding(layers.Layer):
             print(mask)
         return position_embeddings + inputs
 
+
 class ComplexAttentivePooling(layers.Layer):
     def __init__(
         self, num_heads, key_dim, value_dim=None, output_dim=None,
@@ -458,16 +475,44 @@ class ComplexAttentivePooling(layers.Layer):
             initializer="glorot_uniform")
 
         self.query_denses = [
-            ComplexDense(self.key_dim)
-            for _ in range(self.num_heads)
+            ComplexDense(self.key_dim, name=f"query_dense_{i}")
+            for i in range(self.num_heads)
         ]
         self.value_denses = [
-            layers.Dense(self.value_dim, kernel_initializer="glorot_uniform")
-            for _ in range(self.num_heads)
+            layers.Dense(self.value_dim,
+                         kernel_initializer="glorot_uniform",
+                         name=f"value_dense_{i}")
+            for i in range(self.num_heads)
         ]
         self.feedforward = layers.Dense(
-            hidden_dim, kernel_initializer="glorot_uniform")
+            hidden_dim, kernel_initializer="glorot_uniform",
+            name="feedforward")
         self.layer_norm = layers.LayerNormalization(epsilon=1e-6)
+        self._built = True
+    
+    def get_weights(self):
+        weights = []
+        for layer in self.query_denses:
+            weights.extend(layer.get_weights())
+        for layer in self.value_denses:
+            weights.extend(layer.get_weights())
+        weights.extend(self.feedforward.get_weights())
+        weights.extend(self.layer_norm.get_weights())
+        weights.extend(self.key_real.get_weights())
+        weights.extend(self.key_imag.get_weights())
+    
+    def set_weights(self, weights):
+        i = 0
+        for layer in self.query_denses:
+            layer.set_weights(weights[i])
+            i += 1
+        for layer in self.value_denses:
+            layer.set_weights(weights[i])
+            i += 1
+        self.feedforward.set_weights(weights[i])
+        self.layer_norm.set_weights(weights[i + 1])
+        self.key_real.set_weights(weights[i + 2])
+        self.key_imag.set_weights(weights[i + 3])
 
     def call(self, inputs, mask=None):
         if mask is not None:
@@ -480,8 +525,9 @@ class ComplexAttentivePooling(layers.Layer):
 
             score = tf.matmul(query, key)
             probs = tf.exp(self.operation(score)) * mask
-            probs /= tf.reduce_sum(probs - tf.reduce_max(probs, axis=0, keepdims=True),
-                                   axis=1, keepdims=True) + 1e-5
+            probs /= tf.reduce_sum(
+                probs - tf.reduce_max(probs, axis=0, keepdims=True),
+                axis=1, keepdims=True) + 1e-5
             
             value = self.value_denses[i](inputs)
             pooled_value = tf.reduce_sum(probs * value, axis=1, keepdims=False)
@@ -492,6 +538,25 @@ class ComplexAttentivePooling(layers.Layer):
 
     def compute_mask(self, _, mask=None):
         return mask
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "num_heads": self.num_heads,
+            "key_dim": self.key_dim,
+            "value_dim": self.value_dim,
+            "output_dim": self.output_dim,
+            "operation": self.operation
+        })
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+    @staticmethod
+    def get_custom_objects():
+        return {"ComplexAttentivePooling": ComplexAttentivePooling}
 
 
 def accuracy(y_true, y_pred):
