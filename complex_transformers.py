@@ -7,6 +7,7 @@ class ComplexEncoder(layers.Layer):
     def __init__(
         self, intermediate_dim, num_heads, dropout=0,
         attention_width=None, operation="real", use_temperature=False,
+        causal_mask=False,
         **kwargs
     ):
         super(ComplexEncoder, self).__init__(**kwargs)
@@ -17,6 +18,7 @@ class ComplexEncoder(layers.Layer):
         self.use_temperature = use_temperature
         self.attention_width = attention_width
         self.supports_masking = True
+        self.causal_mask = causal_mask
 
     def build(self, input_shape):
         hidden_dim = input_shape[-1]
@@ -25,7 +27,9 @@ class ComplexEncoder(layers.Layer):
         self.attention = MultiHeadComplexAttention(
             self.num_heads, key_dim=head_dim,
             attention_width=self.attention_width,
-            operation=self.operation, use_temperature=self.use_temperature)
+            operation=self.operation,
+            use_temperature=self.use_temperature,
+            causal_mask=self.causal_mask)
         self.attention_dropout = layers.Dropout(rate=self.dropout)
 
         self.feedforward_intermediate = layers.Dense(
@@ -78,20 +82,12 @@ class ComplexDecoder(layers.Layer):
             self.num_heads, key_dim=head_dim, causal_mask=True,
             operation=self.operation, use_temperature=self.use_temperature,
             attention_width=self.attention_width)
-        # self.attention = ComplexAttention(
-        #     key_dim=head_dim, causal_mask=True, operation=self.operation,
-        #     use_temperature=self.use_temperature,
-        #     attention_width=self.attention_width)
         self.attention_dropout = layers.Dropout(rate=self.dropout)
 
         self.cross_attention = MultiHeadComplexAttention(
             self.num_heads, key_dim=head_dim, causal_mask=True,
             operation=self.operation, use_temperature=self.use_temperature,
             attention_width=self.attention_width)
-        # self.cross_attention = ComplexAttention(
-        #     key_dim=head_dim, causal_mask=True, operation=self.operation,
-        #     use_temperature=self.use_temperature,
-        #     attention_width=self.attention_width)
         self.cross_attention_dropout = layers.Dropout(rate=self.dropout)
 
         self.feedforward_intermediate = layers.Dense(
