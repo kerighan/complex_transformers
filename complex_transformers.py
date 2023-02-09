@@ -147,7 +147,7 @@ class ComplexAttention(layers.Layer):
         dropout=0.0,
         operation="real",
         use_temperature=False,
-        use_position=True,
+        use_position=False,
         **kwargs
     ):
         super(ComplexAttention, self).__init__(**kwargs)
@@ -256,6 +256,7 @@ class MultiHeadComplexAttention(layers.Layer):
         causal_mask=False,
         operation="real",
         use_temperature=False,
+        use_position=True,
         **kwargs
     ):
         super(MultiHeadComplexAttention, self).__init__(**kwargs)
@@ -267,6 +268,7 @@ class MultiHeadComplexAttention(layers.Layer):
         self.causal_mask = causal_mask
         self.operation = operation
         self.use_temperature = use_temperature
+        self.use_position = use_position
         self.supports_masking = True
 
     def build(self, input_shape):
@@ -284,6 +286,7 @@ class MultiHeadComplexAttention(layers.Layer):
                              causal_mask=self.causal_mask,
                              operation=self.operation,
                              use_temperature=self.use_temperature,
+                             use_position=self.use_position,
                              name=f"attention_{i}")
             for i in range(self.num_heads)]
         for attention in self.attentions:
@@ -310,7 +313,7 @@ class MultiHeadComplexAttention(layers.Layer):
 class ComplexDense(layers.Layer):
     def __init__(
         self, units, activation=None,
-        use_bias=True, use_polar=False,
+        use_bias=True, use_polar=True,
         **kwargs
     ):
         super(ComplexDense, self).__init__(**kwargs)
