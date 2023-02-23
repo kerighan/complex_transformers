@@ -503,15 +503,15 @@ class PositionalEmbedding(layers.Layer):
         self.n_features = n_features
         self.output_dim = output_dim
         self.supports_masking = True
-    
+
     def build(self, input_shape):
         seq_len = input_shape[1]
         self.embedding = tf.keras.layers.Embedding(
             input_dim=self.n_features,
-            output_dim=self.output_dim)
+            output_dim=self.output_dim,)
         self.positional_embedding = tf.keras.layers.Embedding(
             input_dim=seq_len,
-            output_dim=self.output_dim)
+            output_dim=self.output_dim,)
 
     def call(self, inputs):
         mask = None
@@ -527,12 +527,30 @@ class PositionalEmbedding(layers.Layer):
         if self.mask_zero and mask is not None:
             x *= tf.cast(mask, tf.float32)
         return x
-    
+
     def compute_mask(self, inputs, mask=None):
         if self.mask_zero:
             return tf.not_equal(inputs, 0)
         else:
             return None
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "n_features": self.n_features,
+            "output_dim": self.output_dim,
+            "mask_zero": self.mask_zero
+        })
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+    @staticmethod
+    def get_custom_objects():
+        return {"PositionalEmbedding": PositionalEmbedding}
+
 
 
 class PositionalEncoding(layers.Layer):
@@ -551,6 +569,18 @@ class PositionalEncoding(layers.Layer):
         if mask is not None:
             print(mask)
         return position_embeddings + inputs
+
+    def get_config(self):
+        config = super().get_config()
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+    @staticmethod
+    def get_custom_objects():
+        return {"PositionalEncoding": PositionalEncoding}
 
 
 class ComplexAttentivePooling(layers.Layer):
@@ -676,15 +706,14 @@ def get_operation(operation):
 class SmallAttention(layers.Layer):
     def __init__(
         self, num_heads, intermediate_dim=None,
-        activation=None, kernel_activation="relu",
+        activation=None, kernel_activation="swish",
         **kwargs
     ):
         super().__init__(**kwargs)
         self.num_heads = num_heads
         self.intermediate_dim = intermediate_dim
         self.activation = activation
-        self.kernel_activation = tf.keras.activations.get(kernel_activation)
-
+        self.kernel_activation = kernel_activation
 
     def build(self, input_shape):
         seq_len, in_dim = input_shape[-2:]
@@ -704,7 +733,8 @@ class SmallAttention(layers.Layer):
             name="operator", shape=(self.final_dim, in_dim),
             initializer="glorot_normal")
 
-        self.transform = layers.Dense(in_dim, activation="relu")
+        self.transform = layers.Dense(
+            in_dim, activation=self.kernel_activation)
         self.feedforward = layers.Dense(in_dim, activation=self.activation)
 
         self.layer_norm = layers.LayerNormalization()
@@ -724,8 +754,6 @@ class SmallAttention(layers.Layer):
         values = tf.reduce_sum(values, axis=1)
         values = tf.reshape(values, [-1, self.final_dim])
 
-        # operator = self.kernel_activation(
-        #     tf.matmul(values, self.square_matrix) + self.square_bias)
         operator = tf.matmul(values, self.operator)
         operator = operator[:, None, :]
         operator = tf.repeat(operator, repeats=tf.shape(inputs)[1], axis=1)
@@ -741,3 +769,85 @@ class SmallAttention(layers.Layer):
 
     def compute_mask(self, _, mask=None):
         return mask
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "num_heads": self.num_heads,
+            "intermediate_dim": self.intermediate_dim,
+            "activation": self.activation,
+            "kernel_activation": self.kernel_activation
+        })
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+    @staticmethod
+    def get_custom_objects():
+        return {"SmallAttention": SmallAttention}
+
+
+class SmallPoolingAttention(layers.Layer):
+    def __init__(
+        self, num_heads, intermediate_dim=None, activation=None, **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.num_heads = num_heads
+        self.intermediate_dim = intermediate_dim
+        self.activation = activation
+
+    def build(self, input_shape):
+        seq_len, in_dim = input_shape[-2:]
+        self.seq_len = seq_len
+        self.in_dim = in_dim
+        if self.intermediate_dim is None:
+            self.intermediate_dim = in_dim // self.num_heads
+        self.final_dim = self.num_heads * self.intermediate_dim
+
+        self.attention_weights = self.add_weight(
+            name="attention_weights",
+            shape=(in_dim, self.num_heads))
+        self.values = self.add_weight(
+            name="values",
+            shape=(in_dim, self.num_heads, self.intermediate_dim))
+        self.feedforward = layers.Dense(in_dim, activation=self.activation)
+
+    def call(self, inputs, mask=None):
+        att_weights = tf.matmul(inputs, self.attention_weights)
+        att_weights = tf.exp(att_weights)
+        if mask is not None:
+            mask = tf.expand_dims(tf.cast(mask, tf.float32), axis=-1)
+            att_weights *= mask
+
+        att_weights /= tf.reduce_sum(att_weights, axis=-2, keepdims=True)
+        att_weights = tf.expand_dims(att_weights, -1)
+
+        values = tf.einsum("bsi,ijk->bsjk", inputs, self.values)
+        values *= att_weights
+        values = tf.reduce_sum(values, axis=1)
+        values = tf.reshape(values, [-1, self.final_dim])
+
+        res = self.feedforward(values)
+        return res
+
+    def compute_mask(self, _, mask=None):
+        return mask
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "num_heads": self.num_heads,
+            "intermediate_dim": self.intermediate_dim,
+            "activation": self.activation
+        })
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+    @staticmethod
+    def get_custom_objects():
+        return {"SmallPoolingAttention": SmallPoolingAttention}
