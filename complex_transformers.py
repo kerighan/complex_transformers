@@ -383,8 +383,7 @@ class MultiHeadComplexAttention(layers.Layer):
         hidden_dim = input_shape[-1]
         self.dense = layers.Dense(
             hidden_dim, use_bias=self.use_bias,
-            kernel_initializer="glorot_uniform",
-            name="dense")
+            kernel_initializer="glorot_uniform")
 
         self.attentions = [
             ComplexAttention(key_dim=self.key_dim,
@@ -497,12 +496,16 @@ class AttentionInterference(layers.Layer):
 
 
 class PositionalEmbedding(layers.Layer):
-    def __init__(self, n_features, output_dim, mask_zero=False, **kwargs):
+    def __init__(
+        self, n_features, output_dim, mask_zero=False,
+        positional_activation=None, **kwargs
+    ):
         super(PositionalEmbedding, self).__init__(**kwargs)
         self.mask_zero = mask_zero
         self.n_features = n_features
         self.output_dim = output_dim
         self.supports_masking = True
+        self.positional_activation = activations.get(positional_activation)
 
     def build(self, input_shape):
         seq_len = input_shape[1]
@@ -520,8 +523,9 @@ class PositionalEmbedding(layers.Layer):
 
         input_length = tf.shape(inputs)[1]
 
-        position_indices = tf.range(input_length, dtype=tf.int32)[tf.newaxis, :]
-        position_embeddings = self.positional_embedding(position_indices)
+        position_indices = tf.range(input_length, dtype=tf.int32)[None, :]
+        position_embeddings = self.positional_activation(
+            self.positional_embedding(position_indices))
 
         x = position_embeddings + self.embedding(inputs)
         if self.mask_zero and mask is not None:
@@ -539,7 +543,9 @@ class PositionalEmbedding(layers.Layer):
         config.update({
             "n_features": self.n_features,
             "output_dim": self.output_dim,
-            "mask_zero": self.mask_zero
+            "mask_zero": self.mask_zero,
+            "positional_activation": activations.serialize(
+                self.positional_activation)
         })
         return config
 
@@ -554,9 +560,11 @@ class PositionalEmbedding(layers.Layer):
 
 
 class PositionalEncoding(layers.Layer):
-    def __init__(self, **kwargs):
+    def __init__(self, positional_activation=None, **kwargs):
         super(PositionalEncoding, self).__init__(**kwargs)
         
+        self.positional_activation = activations.get(positional_activation)
+
     def build(self, input_shape):
         seq_len, dim = input_shape[1], input_shape[2]
         self.embedding = tf.keras.layers.Embedding(
@@ -572,6 +580,10 @@ class PositionalEncoding(layers.Layer):
 
     def get_config(self):
         config = super().get_config()
+        config.update({
+            "positional_activation": activations.serialize(
+                self.positional_activation)
+        })
         return config
 
     @classmethod
@@ -705,17 +717,17 @@ def get_operation(operation):
 
 class SmallAttention(layers.Layer):
     def __init__(
-        self, num_heads, intermediate_dim=None,
-        activation=None, kernel_activation="swish",
-        **kwargs
+        self, num_heads, intermediate_dim=None, activation="relu", 
+        name=None, **kwargs
     ):
-        super().__init__(**kwargs)
+        super().__init__(name=name, **kwargs)
         self.num_heads = num_heads
         self.intermediate_dim = intermediate_dim
-        self.activation = activation
-        self.kernel_activation = kernel_activation
+        self.activation = activations.get(activation)
+        self._built = False
+        self.supports_masking = True
 
-    def build(self, input_shape):
+    def _build(self, input_shape):
         seq_len, in_dim = input_shape[-2:]
         self.seq_len = seq_len
         self.in_dim = in_dim
@@ -723,48 +735,72 @@ class SmallAttention(layers.Layer):
             self.intermediate_dim = in_dim // self.num_heads
         self.final_dim = self.num_heads * self.intermediate_dim
 
+        # attention mechanism
         self.attention_weights = self.add_weight(
-            name="attention_weights",
-            shape=(in_dim, self.num_heads))
+            name="attention_weights", shape=(in_dim, self.num_heads),
+            initializer="glorot_normal")
+        self.temperature = self.add_weight(
+            shape=(1, 1, self.num_heads),
+            initializer="ones", name="temperature")
         self.values = self.add_weight(
-            name="values",
-            shape=(in_dim, self.num_heads, self.intermediate_dim))
+            shape=(in_dim, self.num_heads, self.intermediate_dim),
+            initializer="glorot_normal", name="values")
         self.operator = self.add_weight(
             name="operator", shape=(self.final_dim, in_dim),
             initializer="glorot_normal")
 
-        self.transform = layers.Dense(
-            in_dim, activation=self.kernel_activation)
-        self.feedforward = layers.Dense(in_dim, activation=self.activation)
+        # feed forward layers
+        self.feedforward_1 = self.add_weight(
+            name="feedforward_1", shape=(2 * in_dim, in_dim),
+            initializer="glorot_uniform")
+        self.feedforward_1_bias = self.add_weight(
+            name="feedforward_1_bias", shape=(1, 1, in_dim),
+            initializer="zeros")
+        self.feedforward_2 = self.add_weight(
+            name="feedforward_2", shape=(in_dim, in_dim),
+            initializer="glorot_uniform")
+        self.feedforward_2_bias = self.add_weight(
+            name="feedforward_2_bias",
+            shape=(1, 1, in_dim), initializer="zeros")
 
-        self.layer_norm = layers.LayerNormalization()
+        self.layer_norm = layers.LayerNormalization(epsilon=1e-6, axis=-1)
+        self._built = True
 
     def call(self, inputs, mask=None):
+        if not self._built:
+            self._build(inputs.shape)
+
         att_weights = tf.matmul(inputs, self.attention_weights)
+        att_weights -= tf.math.reduce_max(att_weights, axis=-2, keepdims=True)
+        att_weights *= self.temperature
         att_weights = tf.exp(att_weights)
         if mask is not None:
             mask = tf.expand_dims(tf.cast(mask, tf.float32), axis=-1)
             att_weights *= mask
-
-        att_weights /= tf.reduce_sum(att_weights, axis=-2, keepdims=True)
+        att_weights /= (
+            tf.reduce_sum(att_weights, axis=-2, keepdims=True) + 1e-30)
         att_weights = tf.expand_dims(att_weights, -1)
 
         values = tf.einsum("bsi,ijk->bsjk", inputs, self.values)
         values *= att_weights
-        values = tf.reduce_sum(values, axis=1)
+        values = tf.reduce_sum(values, axis=1, keepdims=False)
         values = tf.reshape(values, [-1, self.final_dim])
 
         operator = tf.matmul(values, self.operator)
         operator = operator[:, None, :]
         operator = tf.repeat(operator, repeats=tf.shape(inputs)[1], axis=1)
-
         concat = tf.concat([inputs, operator], axis=-1)
-        res = self.transform(concat)
 
-        res = self.layer_norm(res + inputs)
-        res = self.feedforward(res)
-        if mask is not None:
-            res *= mask
+        # feedforward 1
+        res = tf.matmul(concat, self.feedforward_1)
+        res = self.activation(res + self.feedforward_1_bias)
+
+        # feedforward 2
+        res = tf.matmul(res, self.feedforward_2)
+        res = res + self.feedforward_2_bias
+
+        res += inputs  # residual connection
+        res = self.layer_norm(res)  # layer normalization
         return res
 
     def compute_mask(self, _, mask=None):
@@ -775,8 +811,7 @@ class SmallAttention(layers.Layer):
         config.update({
             "num_heads": self.num_heads,
             "intermediate_dim": self.intermediate_dim,
-            "activation": self.activation,
-            "kernel_activation": self.kernel_activation
+            "activation": activations.serialize(self.activation)
         })
         return config
 
@@ -789,33 +824,45 @@ class SmallAttention(layers.Layer):
         return {"SmallAttention": SmallAttention}
 
 
-class SmallPoolingAttention(layers.Layer):
+class SmallPooling(layers.Layer):
     def __init__(
-        self, num_heads, intermediate_dim=None, activation=None, **kwargs
+        self, num_heads, out_dim=None,
+        activation=None, name=None, **kwargs
     ):
-        super().__init__(**kwargs)
+        super().__init__(name=name, **kwargs)
         self.num_heads = num_heads
-        self.intermediate_dim = intermediate_dim
-        self.activation = activation
+        self.out_dim = out_dim
+        self.activation = activations.get(activation)
 
     def build(self, input_shape):
         seq_len, in_dim = input_shape[-2:]
         self.seq_len = seq_len
         self.in_dim = in_dim
-        if self.intermediate_dim is None:
-            self.intermediate_dim = in_dim // self.num_heads
-        self.final_dim = self.num_heads * self.intermediate_dim
+        if self.out_dim is None:
+            self.out_dim = in_dim
+
+        intermediate_dim = self.out_dim // self.num_heads
+        self.flatten_dim = self.num_heads * intermediate_dim
 
         self.attention_weights = self.add_weight(
             name="attention_weights",
             shape=(in_dim, self.num_heads))
         self.values = self.add_weight(
             name="values",
-            shape=(in_dim, self.num_heads, self.intermediate_dim))
-        self.feedforward = layers.Dense(in_dim, activation=self.activation)
+            shape=(in_dim, self.num_heads, intermediate_dim))
+        self.temperature = self.add_weight(
+            name="temperature",
+            shape=(1, 1, self.num_heads), initializer="ones")
+        self.feedforward = self.add_weight(
+            name="feedforward", shape=(self.flatten_dim, self.out_dim),
+            initializer="glorot_normal")
+        self.feedforward_bias = self.add_weight(
+            name="feedforward_bias", shape=(1, self.out_dim),
+            initializer="zeros")
 
     def call(self, inputs, mask=None):
         att_weights = tf.matmul(inputs, self.attention_weights)
+        att_weights *= self.temperature
         att_weights = tf.exp(att_weights)
         if mask is not None:
             mask = tf.expand_dims(tf.cast(mask, tf.float32), axis=-1)
@@ -827,9 +874,12 @@ class SmallPoolingAttention(layers.Layer):
         values = tf.einsum("bsi,ijk->bsjk", inputs, self.values)
         values *= att_weights
         values = tf.reduce_sum(values, axis=1)
-        values = tf.reshape(values, [-1, self.final_dim])
+        values = tf.reshape(values, [-1, self.flatten_dim])
 
-        res = self.feedforward(values)
+        # feedforward
+        res = tf.matmul(values, self.feedforward)
+        res += self.feedforward_bias
+        res = self.activation(res)
         return res
 
     def compute_mask(self, _, mask=None):
@@ -839,8 +889,8 @@ class SmallPoolingAttention(layers.Layer):
         config = super().get_config()
         config.update({
             "num_heads": self.num_heads,
-            "intermediate_dim": self.intermediate_dim,
-            "activation": self.activation
+            "out_dim": self.out_dim,
+            "activation": activations.serialize(self.activation)
         })
         return config
 
@@ -850,4 +900,4 @@ class SmallPoolingAttention(layers.Layer):
 
     @staticmethod
     def get_custom_objects():
-        return {"SmallPoolingAttention": SmallPoolingAttention}
+        return {"SmallPooling": SmallPooling}
