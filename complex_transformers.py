@@ -252,6 +252,7 @@ class ComplexAttention(layers.Layer):
     def compute_mask(self, _, mask=None):
         return mask
 
+
 class ComplexAttention(layers.Layer):
     def __init__(
         self,
