@@ -1,6 +1,13 @@
-from tensorflow.keras import layers, activations
+from tensorflow.keras import layers, activations, initializers
 import tensorflow as tf
 import numpy as np
+
+
+def clone_initializer(initializer):
+    if not isinstance(initializer, initializers.Initializer):
+        return initializer
+    config = initializer.get_config()
+    return initializer.__class__.from_config(config)
 
 
 class ComplexEncoder(layers.Layer):
@@ -34,9 +41,9 @@ class ComplexEncoder(layers.Layer):
 
         self.feedforward_intermediate = layers.Dense(
             self.intermediate_dim, activation="relu",
-            kernel_initializer="glorot_uniform")
+            kernel_initializer=clone_initializer("glorot_uniform"))
         self.feedforward_output = layers.Dense(
-            hidden_dim, kernel_initializer="glorot_uniform")
+            hidden_dim, kernel_initializer=clone_initializer("glorot_uniform"))
         self.feedforward_dropout = layers.Dropout(rate=self.dropout)
 
         self.layer_norm_1 = layers.LayerNormalization(epsilon=1e-5)
@@ -92,9 +99,10 @@ class ComplexDecoder(layers.Layer):
 
         self.feedforward_intermediate = layers.Dense(
             self.intermediate_dim, activation="relu",
-            kernel_initializer="glorot_uniform")
+            kernel_initializer=clone_initializer("glorot_uniform"))
         self.feedforward_output = layers.Dense(
-            hidden_dim, activation=None, kernel_initializer="glorot_uniform")
+            hidden_dim, activation=None,
+            kernel_initializer=clone_initializer("glorot_uniform"))
         self.feedforward_dropout = layers.Dropout(rate=self.dropout)
 
         self.layer_norm_1 = layers.LayerNormalization(epsilon=1e-5)
@@ -167,7 +175,7 @@ class ComplexAttention(layers.Layer):
         self.key = ComplexDense(self.key_dim, use_bias=self.use_bias)
         self.value = layers.Dense(
             self.value_dim, use_bias=self.use_bias,
-            kernel_initializer="glorot_uniform")
+            kernel_initializer=clone_initializer("glorot_uniform"))
         self.dropout = layers.Dropout(rate=self.dropout)
 
         self.temperature = self.add_weight(
@@ -275,7 +283,7 @@ class ComplexAttention(layers.Layer):
         self.key = ComplexDense(self.key_dim, use_bias=self.use_bias)
         self.value = layers.Dense(
             self.value_dim, use_bias=self.use_bias,
-            kernel_initializer="glorot_uniform")
+            kernel_initializer=clone_initializer("glorot_uniform"))
         self.dropout = layers.Dropout(rate=self.dropout)
 
         self.temperature = self.add_weight(
@@ -383,7 +391,7 @@ class MultiHeadComplexAttention(layers.Layer):
         hidden_dim = input_shape[-1]
         self.dense = layers.Dense(
             hidden_dim, use_bias=self.use_bias,
-            kernel_initializer="glorot_uniform")
+            kernel_initializer=clone_initializer("glorot_uniform"))
 
         self.attentions = [
             ComplexAttention(key_dim=self.key_dim,
@@ -434,11 +442,11 @@ class ComplexDense(layers.Layer):
         self.dense_1 = layers.Dense(
             self.units, use_bias=self.use_bias,
             activation=self.activation,
-            kernel_initializer="glorot_uniform")
+            kernel_initializer=clone_initializer("glorot_uniform"))
         self.dense_2 = layers.Dense(
             self.units, use_bias=self.use_bias,
             activation=self.activation,
-            kernel_initializer="glorot_uniform")
+            kernel_initializer=clone_initializer("glorot_uniform"))
 
     def call(self, inputs):
         if self.use_polar:
@@ -473,16 +481,16 @@ class AttentionInterference(layers.Layer):
         shape = (seq_len, self.units)
         self.query_real = self.add_weight(
             "query_real", shape=shape,
-            initializer="glorot_uniform")
+            initializer=clone_initializer("glorot_uniform"))
         self.query_imag = self.add_weight(
             "query_imag", shape=shape,
-            initializer="glorot_uniform")
+            initializer=clone_initializer("glorot_uniform"))
         self.key_real = self.add_weight(
             "key_real", shape=shape,
-            initializer="glorot_uniform")
+            initializer=clone_initializer("glorot_uniform"))
         self.key_imag = self.add_weight(
             "key_imag", shape=shape,
-            initializer="glorot_uniform")
+            initializer=clone_initializer("glorot_uniform"))
 
     def call(self, _, mask=None):
         key = tf.complex(self.key_real, self.key_imag)[None, :, :]
@@ -561,7 +569,6 @@ class PositionalEmbedding(layers.Layer):
 class PositionalEncoding(layers.Layer):
     def __init__(self, positional_activation=None, **kwargs):
         super(PositionalEncoding, self).__init__(**kwargs)
-        
         self.positional_activation = activations.get(positional_activation)
 
     def build(self, input_shape):
@@ -571,7 +578,8 @@ class PositionalEncoding(layers.Layer):
 
     def call(self, inputs, mask=None):
         input_length = tf.shape(inputs)[1]
-        position_indices = tf.range(input_length, dtype=tf.int32)[tf.newaxis, :]
+        position_indices = tf.range(
+            input_length, dtype=tf.int32)[tf.newaxis, :]
         position_embeddings = self.embedding(position_indices)
         if mask is not None:
             print(mask)
@@ -616,11 +624,11 @@ class ComplexAttentivePooling(layers.Layer):
         self.key_real = self.add_weight(
             name="key_real",
             shape=(self.num_heads, self.key_dim,),
-            initializer="glorot_uniform")
+            initializer=clone_initializer("glorot_uniform"))
         self.key_imag = self.add_weight(
             name="key_imag",
             shape=(self.num_heads, self.key_dim,),
-            initializer="glorot_uniform")
+            initializer=clone_initializer("glorot_uniform"))
         self.temperature = self.add_weight(
             name="temperature", shape=self.num_heads, initializer="ones")
 
@@ -630,12 +638,14 @@ class ComplexAttentivePooling(layers.Layer):
             for i in range(self.num_heads)
         ]
         self.value_dense = [
-            layers.Dense(self.value_dim, kernel_initializer="glorot_uniform",
-                         name=f"value_dense_{i}")
+            layers.Dense(
+                self.value_dim,
+                kernel_initializer=clone_initializer("glorot_uniform"),
+                name=f"value_dense_{i}")
             for i in range(self.num_heads)
         ]
         self.feedforward = layers.Dense(
-            hidden_dim, kernel_initializer="glorot_uniform",
+            hidden_dim, kernel_initializer=clone_initializer("glorot_uniform"),
             name="feedforward")
         self.layer_norm = layers.LayerNormalization(epsilon=1e-6)
         self.layer_norm_2 = layers.LayerNormalization(epsilon=1e-6)
